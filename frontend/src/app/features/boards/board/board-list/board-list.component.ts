@@ -64,7 +64,6 @@ import { HalResourceNotificationService } from 'core-app/features/hal/services/h
 import { BoardActionsRegistryService } from 'core-app/features/boards/board/board-actions/board-actions-registry.service';
 import { BoardActionService } from 'core-app/features/boards/board/board-actions/board-action.service';
 import { ComponentType } from '@angular/cdk/portal';
-import { CausedUpdatesService } from 'core-app/features/boards/board/caused-updates/caused-updates.service';
 import { BoardListMenuComponent } from 'core-app/features/boards/board/board-list/board-list-menu.component';
 import { debugLog } from 'core-app/shared/helpers/debug_output';
 import { WorkPackageCardDragAndDropService } from 'core-app/features/work-packages/components/wp-card-view/services/wp-card-drag-and-drop.service';
@@ -75,7 +74,6 @@ import { BoardListCrossSelectionService } from 'core-app/features/boards/board/b
 import {
   debounceTime,
   filter,
-  map,
 } from 'rxjs/operators';
 import { ChangeItem } from 'core-app/shared/components/fields/changeset/changeset';
 import { WorkPackageChangeset } from 'core-app/features/work-packages/components/wp-edit/work-package-changeset';
@@ -106,6 +104,7 @@ export function listNeedsReload(
   rendered:{ id:string|null }[],
   workPackageId:string,
   change:ChangeItem,
+  requiresQuery = false,
 ):boolean {
   if (!actionHref) {
     return false;
@@ -115,7 +114,7 @@ export function listNeedsReload(
   const belongsHere = hrefsOf(change.to).includes(actionHref);
   const affected = belongsHere || hrefsOf(change.from).includes(actionHref);
 
-  return affected && belongsHere !== rendered.some((wp) => wp.id === workPackageId);
+  return affected && (requiresQuery || belongsHere !== rendered.some((wp) => wp.id === workPackageId));
 }
 
 @Component({
@@ -155,7 +154,6 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
   readonly schemaCache = inject(SchemaCacheService);
   readonly boardService = inject(BoardService);
   readonly boardActionRegistry = inject(BoardActionsRegistryService);
-  readonly causedUpdates = inject(CausedUpdatesService);
   readonly cardDragDrop = inject(WorkPackageCardDragAndDropService);
   readonly keepTab = inject(KeepTabService);
   readonly currentProject = inject(CurrentProjectService);
@@ -205,6 +203,8 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
    */
   private queryRequestSerial = 0;
 
+  private queryPending = false;
+
   public columnsQueryProps:HTTPClientParamMap;
 
   public get text() {
@@ -227,6 +227,8 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
 
   /** Editing handler to be passed into card component */
   public workPackageAddedHandler = async (workPackage:WorkPackageResource):Promise<WorkPackageAddedResult> => {
+    const hadPendingQuery = this.queryPending;
+    const requestSerial = this.queryRequestSerial;
     this.savingWorkPackageIds.add(workPackage.id!);
     try {
       await this.addWorkPackage(workPackage);
@@ -234,8 +236,30 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
       this.savingWorkPackageIds.delete(workPackage.id!);
     }
 
-    return { membershipPersisted: this.board.isAction };
+    const saved = this.states.workPackages.get(workPackage.id!).value ?? workPackage;
+    return {
+      membershipPersisted: this.board.isAction,
+      needsQueryRefresh: () => this.board.isAction && (
+        hadPendingQuery || requestSerial !== this.queryRequestSerial || this.requiresQuery
+        || this.actionService!.affectsOtherCards(saved, this.cardDragDrop.workPackages ?? [])
+      ),
+    };
   };
+
+  public retainsCard = (workPackage:WorkPackageResource):boolean => {
+    const versions = workPackage.$links.targetVersions;
+    return this.board.actionAttribute === 'version'
+      && Array.isArray(versions)
+      && versions.some((version) => version.href === this.actionResource?.href);
+  };
+
+  private get requiresQuery():boolean {
+    const results = this.querySpace.results.value;
+    return this.queryPending
+      || this.board.actionAttribute === 'subproject'
+      || this.boardFilters.current.length > 0
+      || !!(results && (results.total > results.count || (this.cardDragDrop.workPackages?.length ?? 0) >= results.pageSize));
+  }
 
   /** Move check to be passed into card component */
   public canDragOutOf = false;
@@ -396,8 +420,9 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
     return this.board.showStatusButton();
   }
 
-  public refreshQueryUnlessCaused(query:QueryResource, visibly = true) {
-    if (!this.causedUpdates.includes(query)) {
+  public refreshQueryIfOutdated(query:QueryResource, visibly = true) {
+    // A pending response can still contain cards from before the acknowledged move.
+    if (this.queryPending || !query.updatedAt || this.query?.updatedAt !== query.updatedAt) {
       debugLog(`Refreshing ${query.name} visibly due to external changes`);
       this.updateQuery(visibly);
     }
@@ -484,6 +509,7 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
   }
 
   private loadQuery(visibly = true) {
+    this.queryPending = true;
     this.queryRequestSerial += 1;
     const requestSerial = this.queryRequestSerial;
     let observable = this
@@ -504,6 +530,7 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
             return;
           }
 
+          this.queryPending = false;
           this.wpStatesInitialization.updateQuerySpace(query, query.results);
         },
         (error) => {
@@ -511,6 +538,7 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
             return;
           }
 
+          this.queryPending = false;
           const userIsNotAllowedToSeeSubprojectError = 'urn:openproject-org:api:v3:errors:InvalidQuery';
           // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
           if (error.errorIdentifier === userIsNotAllowedToSeeSubprojectError) {
@@ -555,17 +583,18 @@ export class BoardListComponent extends AbstractWidgetComponent implements OnIni
         // Only allow updates, otherwise this causes an error reloading the list
         // before the work package can be added to the query order
         filter((event) => event.eventType === 'updated'),
-        map((event:HalEvent) => {
-          const changes = event.commit?.changes;
+        filter((event:HalEvent) => {
+          const commit = event.commit;
+          const changes = commit?.changes;
           const attribute = this.actionService!.watchedAttributes.find((name) => changes?.[name]);
-          return attribute && changes ? { id: event.id, value: changes[attribute] } : undefined;
+          if (!attribute || !commit || this.savingWorkPackageIds.has(event.id)) {
+            return false;
+          }
+
+          const cards = this.cardDragDrop.workPackages ?? [];
+          return this.actionService!.affectsOtherCards(commit.resource as WorkPackageResource, cards)
+            || listNeedsReload(this.actionResource?.href, cards, event.id, commit.changes[attribute], this.requiresQuery);
         }),
-        filter((change):change is { id:string, value:ChangeItem } => !!change),
-        // A project move also moves the descendants on the server, which the cards
-        // cannot show, so subproject lists keep reloading on every change.
-        filter(({ id, value }) => this.board.actionAttribute === 'subproject'
-          || (!this.savingWorkPackageIds.has(id)
-            && listNeedsReload(this.actionResource?.href, this.cardDragDrop.workPackages ?? [], id, value))),
         this.untilDestroyed(),
       )
       .subscribe(() => {
